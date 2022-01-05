@@ -135,10 +135,10 @@ class ModMLP(nn.Module):
         assert n_layers >= 1
 
         self.mlp = nn.ModuleList([
-            nn.Sequential(
+            nn.ModuleList([
                 ModLin(d_emb, d_cond, n_function),
-                nn.GELU()
-            )
+                nn.GELU(),
+            ])
             for _ in range(n_layers-1)
         ])
 
@@ -158,8 +158,9 @@ class ModMLP(nn.Module):
             y: Output of token embeddings for each function.
                 Shape of [batch_size, n_token, n_function, embedding_size]
         """
-        for layer in self.mlp:
-            x = layer(x, c)
+        for linear, activation in self.mlp:
+            x = linear(x, c)
+            x = activation(x)
         return self.last_linear(x, c)
 
     def repeat_x(self, x: torch.Tensor):
@@ -218,6 +219,52 @@ class ModAttn(nn.Module):
         return self.linear.repeat_x(x)
 
 
+class LineOfCode(nn.Module):
+    """ModAttn layer followed by a ModMLP layer.
+    """
+    def __init__(
+            self,
+            d_emb: int,
+            d_cond: int,
+            n_function: int,
+            n_layers: int,
+        ):
+        super().__init__()
+        self.d_emb = d_emb
+
+        self.attention = ModAttn(d_emb, d_cond, n_function)
+        self.mlp = ModMLP(d_emb, d_cond, n_function, n_layers)
+        self.norm_x = nn.LayerNorm(d_emb)
+        self.norm_a = nn.LayerNorm(d_emb)
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor, C: torch.Tensor):
+        """Compute a line of code, which is a modulated attention followed by a modulated MLP layer.
+        Everything is pondered by the type matching mecanisme.
+
+        Args
+        ----
+            x: Token embeddings for each function.
+                Shape of [batch_size, n_token, n_function, embedding_size]
+            c: Function codes.
+                Shape of [n_function, code_size]
+            C: Compatibility matrix.
+                Shape of [batch_size, n_token, n_function]
+
+        Output
+        ------
+            b: Token embeddings for each function.
+                Shape of [batch_size, n_token, n_function, embedding_size]
+        """
+        mod = repeat(C, 'b t f -> b t f e', e=self.d_emb)
+        a = self.attention(self.norm_x(x), c, C)  # [batch_size, n_token, n_function, embedding_size]
+        a = x + mod * a
+
+        b = self.mlp(self.norm_a(a), c)  # [batch_size, n_token, n_function, embedding_size]
+        b = a + mod * b
+        return b
+
+
+
 if __name__ == '__main__':
     b_size, n_token, n_function = 128, 10, 5
     n_emb, n_layers, n_signature = 100, 5, 40
@@ -229,5 +276,5 @@ if __name__ == '__main__':
     threshold = 0.1
     # summary(model, input_data=[x, s, threshold])
 
-    model = ModAttn(n_emb, n_cond, n_function)
+    model = LineOfCode(n_emb, n_cond, n_function, n_layers)
     summary(model, input_size=[(b_size, n_token, n_function, n_emb), (n_function, n_cond), (b_size, n_token, n_function)])
