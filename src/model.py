@@ -14,7 +14,7 @@ class TypeInference(nn.Module):
     """Compute the type vector.
     The vector is normalized.
     """
-    def __init__(self, d_emb: int, n_layers: int, d_out: int):
+    def __init__(self, d_emb: int, n_layers: int, d_signature: int):
         super().__init__()
 
         self.mlp = nn.ModuleList([
@@ -25,7 +25,7 @@ class TypeInference(nn.Module):
             for _ in range(n_layers)
         ])
 
-        self.last_linear = nn.Linear(d_emb, d_out)
+        self.last_linear = nn.Linear(d_emb, d_signature)
 
     def forward(self, x):
         for layer in self.mlp:
@@ -73,6 +73,8 @@ class ModLin(nn.Module):
     """Linear layer modulated by a conditional vector.
     It is actually a stack of the original ModLin layer. There is
     one ModLin for each function.
+
+    TODO: How are the parameters shared accross the functions?
     """
     def __init__(self, d_emb: int, d_cond: int, n_function: int):
         super().__init__()
@@ -263,18 +265,154 @@ class LineOfCode(nn.Module):
         b = a + mod * b
         return b
 
+    def repeat_x(self, x: torch.Tensor):
+        return self.attention.repeat_x(x)
+
+
+class Interpreter(nn.Module):
+    """Stack of multiple lines of code, sharing the same codes function.
+    """
+    def __init__(
+        self, 
+        d_emb: int,
+        d_cond: int,
+        n_function: int,
+        n_layers_mlp: int,
+        n_lines: int,
+    ):
+        super().__init__()
+
+        self.loc_stack = nn.ModuleList([
+            LineOfCode(d_emb, d_cond, n_function, n_layers_mlp)
+            for _ in range(n_lines)
+        ])
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor, C: torch.Tensor):
+        """Pass the tokens into all the line of code.
+        Everything is pondered by the type matching mecanisme.
+
+        Args
+        ----
+            x: Token embeddings.
+                Shape of [batch_size, n_token, embedding_size]
+            c: Function codes.
+                Shape of [n_function, code_size]
+            C: Compatibility matrix.
+                Shape of [batch_size, n_token, n_function]
+
+        Output
+        ------
+            y: Token embeddings after all line of codes.
+                Shape of [batch_size, n_token, embedding_size]
+        """
+        v = self.loc_stack[0].repeat_x(x)  # [batch_size, n_token, n_function, embedding_size]
+        for loc in self.loc_stack:
+            v = loc(v, c, C)
+
+        v = torch.einsum('btfe, btf -> bte', v, C)  # [batch_size, n_token, embedding_size]
+        y = x + v
+        return y
+
+
+class FunctionIteration(nn.Module):
+    """Combine the interpreter with the type matching mecanism.
+    Create the code and signature function.
+    """
+    def __init__(
+        self, 
+        d_emb: int,
+        d_cond: int,
+        n_function: int,
+        n_layers_mlp: int,
+        n_lines: int,
+        d_signature: int,
+    ):
+        super().__init__()
+
+        self.codes = nn.Parameter(
+            torch.randn((n_function, d_cond))
+        )
+        self.signatures = nn.Parameter(
+                torch.randn((n_function, d_signature))
+        )
+
+        self.interpreter = Interpreter(d_emb, d_cond, n_function, n_layers_mlp, n_lines)
+        self.type_matching = TypeMatching(d_emb, n_layers_mlp, d_signature)
+
+    def forward(self, x: torch.Tensor, threshold: float):
+        """Compute the type of each tokens and pass them into an interpreter.
+
+        Args
+        ----
+            x: Token embeddings.
+                Shape of [batch_size, n_token, embedding_size]
+            threshold: Threshold for the type type matching mechanism.
+
+        Output
+        ------
+            y: Token embeddings after the interpreter.
+                Shape of [batch_size, n_token, embedding_size]
+        """
+        C = self.type_matching(x, self.signatures, threshold)
+        y = self.interpreter(x, self.codes, C)
+        return y
+
+
+class Script(nn.Module):
+    """Stack multiple function iterations.
+    """
+    def __init__(
+        self, 
+        d_emb: int,
+        d_cond: int,
+        n_function: int,
+        n_layers_mlp: int,
+        n_lines: int,
+        d_signature: int,
+        n_fn_iteration: int,
+    ):
+        super().__init__()
+
+        self.fn_iterations = nn.ModuleList([
+            FunctionIteration(d_emb, d_cond, n_function, n_layers_mlp, n_lines, d_signature)
+            for _ in range(n_fn_iteration)
+        ])
+
+    def forward(self, x: torch.Tensor, threshold: float):
+        """Pass the tokens through the multiple function iterations.
+
+        Args
+        ----
+            x: Token embeddings.
+                Shape of [batch_size, n_token, embedding_size]
+            threshold: Threshold for the type matching mechanism.
+
+        Output
+        ------
+            y: Token embeddings after the multiple function iterations.
+                Shape of [batch_size, n_token, embedding_size]
+        """
+        for fn_iteration in self.fn_iterations:
+            x = fn_iteration(x, threshold)
+        return x
 
 
 if __name__ == '__main__':
-    b_size, n_token, n_function = 128, 10, 5
-    n_emb, n_layers, n_signature = 100, 5, 40
-    n_cond = 40
+    config = {
+        'n_function': 5,
+        'n_layers_mlp': 3,
+        'n_lines': 2,
+        'n_fn_iteration': 3,
+        'd_emb': 50,
+        'd_cond': 30,
+        'd_signature': 30,
+    }
+    other = {
+        'b_size': 128,
+        'n_token': 10,
+        'threshold': 0.1
+    }
 
-    model = TypeMatching(n_emb, n_layers, n_signature)
-    x = torch.randn((b_size, n_token, n_emb))
-    s = torch.randn((n_function, n_signature))
-    threshold = 0.1
-    # summary(model, input_data=[x, s, threshold])
-
-    model = LineOfCode(n_emb, n_cond, n_function, n_layers)
-    summary(model, input_size=[(b_size, n_token, n_function, n_emb), (n_function, n_cond), (b_size, n_token, n_function)])
+    model = Script(**config)
+    x = torch.randn((other['b_size'], other['n_token'], config['d_emb']))
+    summary(model, input_data=[x, other['threshold']])
